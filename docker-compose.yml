@@ -1,0 +1,22 @@
+services:
+  browserless:
+    image: browserless/chrome:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - DISPLAY=host.docker.internal:0
+      - DEBUG=browserless*
+      - MAX_CONCURRENT_SESSIONS=10
+      - CONNECTION_TIMEOUT=600000
+      - MAX_QUEUE_LENGTH=10
+      - PREBOOT_CHROME=true
+      - ENABLE_DEBUGGER=false
+      - WORKSPACE_DELETE_EXPIRED=true
+      - DEFAULT_BLOCK_ADS=false
+      - DEFAULT_HEADLESS=true
+      - DEFAULT_IGNORE_HTTPS_ERRORS=true
+      - CHROME_ARGS=--disable-blink-features=AutomationControlled --disable-features=IsolateOrigins,site-per-process --disable-setuid-sandbox --no-sandbox --disable-dev-shm-usage --disable-web-security --allow-running-insecure-content
+    restart: unless-stopped
+    shm_size: '2gb'
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
