@@ -44,18 +44,29 @@ public class HltvScraperService {
     @PostConstruct
     public void initialize() {
         log.info("Initializing HLTV scraper service");
-        // Start initial scrape in background
-        new Thread(this::startScraping).start();
+        // Only start scraping if browser is available
+        if (browserService.isBrowserAvailable()) {
+            log.info("Browser is available, starting initial scrape");
+            new Thread(this::startScraping).start();
+        } else {
+            log.warn("Browser is not available - scraping is disabled. Use mock endpoints at /api/mock/matches for offline development");
+        }
     }
 
     @Scheduled(fixedDelay = 1800000) // Re-scrape every 30 minutes
     public void scheduledScrape() {
-        if (!isScraperRunning) {
+        if (!isScraperRunning && browserService.isBrowserAvailable()) {
             new Thread(this::startScraping).start();
         }
     }
 
     private void startScraping() {
+        // Double-check browser availability before starting
+        if (!browserService.isBrowserAvailable()) {
+            log.warn("Cannot start scraping - browser is not available");
+            return;
+        }
+
         isScraperRunning = true;
         try {
             log.info("Starting HLTV scraping session");
@@ -372,26 +383,53 @@ public class HltvScraperService {
 
                 // Take screenshot for debugging
                 try {
-                    currentPage.screenshot(new Page.ScreenshotOptions().setPath(java.nio.file.Paths.get("captcha-page.png")));
-                    log.info("Saved captcha screenshot to captcha-page.png");
+                    String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));
+                    java.nio.file.Path screenshotDir = java.nio.file.Paths.get("screenshots");
+                    if (!java.nio.file.Files.exists(screenshotDir)) {
+                        java.nio.file.Files.createDirectories(screenshotDir);
+                    }
+                    java.nio.file.Path screenshotPath = screenshotDir.resolve("captcha_" + timestamp + ".png");
+                    currentPage.screenshot(new Page.ScreenshotOptions().setPath(screenshotPath).setFullPage(true));
+                    log.info("Saved captcha screenshot to {}", screenshotPath.toAbsolutePath());
                 } catch (Exception e) {
                     log.warn("Could not save screenshot: {}", e.getMessage());
                 }
 
-                // Debug: log page HTML snippet
+                // Debug: log page HTML snippet and challenge details
                 try {
-                    String captchaHtml = (String) currentPage.evaluate("""
+                    String challengeInfo = (String) currentPage.evaluate("""
                         () => {
-                            const recaptcha = document.querySelector('.g-recaptcha');
-                            if (recaptcha) {
-                                return recaptcha.outerHTML;
-                            }
-                            return 'No .g-recaptcha found';
+                            const info = {
+                                title: document.title,
+                                url: window.location.href,
+                                hasRecaptcha: !!document.querySelector('.g-recaptcha'),
+                                hasChallenge: !!document.querySelector('#challenge-form'),
+                                hasTurnstileInput: !!document.querySelector('[name="cf-turnstile-response"]'),
+                                challengeFormHTML: document.querySelector('#challenge-form')?.innerHTML?.substring(0, 500),
+                                bodyClasses: document.body?.className,
+                                iframes: Array.from(document.querySelectorAll('iframe')).map(i => i.src).slice(0, 3),
+                                scripts: Array.from(document.querySelectorAll('script[src]'))
+                                    .map(s => s.src)
+                                    .filter(src => src.includes('turnstile') || src.includes('challenge') || src.includes('captcha'))
+                                    .slice(0, 3)
+                            };
+                            return JSON.stringify(info, null, 2);
                         }
                         """);
-                    log.info("Captcha HTML: {}", captchaHtml);
+                    log.info("Challenge page info: {}", challengeInfo);
                 } catch (Exception e) {
-                    log.warn("Could not get captcha HTML: {}", e.getMessage());
+                    log.warn("Could not get challenge info: {}", e.getMessage());
+                }
+
+                // Save page HTML for debugging
+                try {
+                    String timestamp = LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd_HH-mm-ss"));
+                    java.nio.file.Path htmlPath = java.nio.file.Paths.get("screenshots").resolve("captcha_" + timestamp + ".html");
+                    String pageHtml = currentPage.content();
+                    java.nio.file.Files.writeString(htmlPath, pageHtml);
+                    log.info("Saved page HTML to {}", htmlPath.toAbsolutePath());
+                } catch (Exception e) {
+                    log.warn("Could not save page HTML: {}", e.getMessage());
                 }
 
                 // Try reCAPTCHA first
@@ -409,6 +447,7 @@ public class HltvScraperService {
                 }
 
                 // Try Cloudflare Turnstile
+                log.info("Attempting to detect Cloudflare Turnstile site key...");
                 String turnstileSiteKey = captchaSolver.detectTurnstileSiteKey(currentPage);
                 if (turnstileSiteKey != null) {
                     log.info("Detected Cloudflare Turnstile with site key: {}", turnstileSiteKey);
@@ -417,12 +456,15 @@ public class HltvScraperService {
                         log.info("Successfully solved Turnstile");
                         Thread.sleep(3000);
                         return;
+                    } else {
+                        log.warn("Turnstile solving failed - check 2captcha balance and API key");
                     }
                 } else {
-                    log.warn("Could not detect Turnstile site key");
+                    log.warn("Could not detect Turnstile site key - the challenge page may not have loaded the widget yet or may be a different type");
+                    log.warn("This usually means Cloudflare is showing an auto-solving challenge that doesn't require manual solving");
                 }
 
-                log.warn("Could not detect or solve captcha type");
+                log.warn("Could not detect or solve captcha type - may need to wait longer or use different approach");
             }
 
             // Final check

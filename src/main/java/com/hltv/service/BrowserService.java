@@ -16,14 +16,21 @@ public class BrowserService {
     private Playwright playwright;
     private Browser browser;
     private volatile boolean isShuttingDown = false;
+    private volatile boolean browserInitialized = false;
 
     public BrowserService(ScraperConfig config) {
         this.config = config;
-        initializeBrowser();
+        // Don't initialize browser in constructor - do it lazily when needed
+        // This allows the app to start even when offline
     }
 
-    private void initializeBrowser() {
+    private synchronized void initializeBrowser() {
+        if (browserInitialized || isShuttingDown) {
+            return;
+        }
+
         try {
+            log.info("Initializing browser service...");
             playwright = Playwright.create();
 
             if (config.getBrowserless().isEnabled()) {
@@ -40,13 +47,28 @@ public class BrowserService {
                     .setTimeout(60000)); // 60 second timeout for browser to start
                 log.info("Successfully launched local browser");
             }
+            browserInitialized = true;
         } catch (Exception e) {
-            log.error("Failed to initialize browser connection", e);
-            throw new RuntimeException("Failed to connect to browser", e);
+            log.error("Failed to initialize browser connection - scraping will not be available", e);
+            // Don't throw - just log the error and allow app to continue
+            browserInitialized = false;
         }
     }
 
+    public boolean isBrowserAvailable() {
+        return browserInitialized && browser != null;
+    }
+
     public Page createStealthPage() {
+        // Initialize browser if not already done
+        if (!browserInitialized) {
+            initializeBrowser();
+        }
+
+        if (!isBrowserAvailable()) {
+            throw new RuntimeException("Browser is not available - cannot create page");
+        }
+
         try {
             Browser.NewContextOptions contextOptions = new Browser.NewContextOptions()
                 .setUserAgent(config.getScraper().getUserAgent())

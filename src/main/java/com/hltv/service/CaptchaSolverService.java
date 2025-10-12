@@ -283,34 +283,80 @@ public class CaptchaSolverService {
     private boolean injectTurnstileSolution(Page page, String solution) {
         try {
             // Inject the Turnstile response token
-            page.evaluate("""
+            Boolean injected = (Boolean) page.evaluate("""
                 (token) => {
+                    console.log('Attempting to inject Turnstile token:', token.substring(0, 20) + '...');
+
                     // Find Turnstile response input
                     const input = document.querySelector('[name="cf-turnstile-response"]');
                     if (input) {
                         input.value = token;
+                        console.log('Set cf-turnstile-response input value');
+                    } else {
+                        console.log('No cf-turnstile-response input found');
+                    }
+
+                    // Also try hidden input
+                    const hiddenInput = document.querySelector('input[type="hidden"][name*="turnstile"]');
+                    if (hiddenInput) {
+                        hiddenInput.value = token;
+                        console.log('Set hidden turnstile input value');
                     }
 
                     // Trigger turnstile callback if exists
-                    if (window.turnstile && window.turnstile.render) {
+                    if (window.turnstile) {
+                        console.log('Found window.turnstile object');
                         try {
-                            const callback = window.turnstileCallback;
-                            if (callback && typeof callback === 'function') {
-                                callback(token);
+                            // Try to find and call the callback
+                            if (window.turnstileCallback && typeof window.turnstileCallback === 'function') {
+                                window.turnstileCallback(token);
+                                console.log('Called window.turnstileCallback');
+                            }
+
+                            // Try alternative callback names
+                            if (window.onTurnstileCallback && typeof window.onTurnstileCallback === 'function') {
+                                window.onTurnstileCallback(token);
+                                console.log('Called window.onTurnstileCallback');
                             }
                         } catch (e) {
                             console.log('Could not trigger turnstile callback:', e);
                         }
                     }
 
-                    return true;
+                    // Try to submit the challenge form automatically
+                    const challengeForm = document.querySelector('#challenge-form');
+                    if (challengeForm && input) {
+                        console.log('Found challenge form, will attempt submit after delay');
+                        setTimeout(() => {
+                            try {
+                                challengeForm.submit();
+                                console.log('Submitted challenge form');
+                            } catch (e) {
+                                console.log('Could not submit form:', e);
+                            }
+                        }, 1000);
+                        return true;
+                    }
+
+                    return input !== null;
                 }
                 """, solution);
 
-            log.info("Injected Turnstile solution into page");
-            Thread.sleep(2000);
+            log.info("Injected Turnstile solution into page (success: {})", injected);
 
-            return true;
+            // Wait for form submission and page navigation
+            Thread.sleep(5000);
+
+            // Check if page has changed (challenge passed)
+            String newTitle = page.title();
+            log.info("Page title after injection: {}", newTitle);
+
+            if (!newTitle.contains("Just a moment")) {
+                log.info("Successfully bypassed Cloudflare challenge!");
+                return true;
+            }
+
+            return Boolean.TRUE.equals(injected);
         } catch (Exception e) {
             log.error("Error injecting turnstile solution", e);
             return false;
@@ -399,7 +445,7 @@ public class CaptchaSolverService {
                     for (let iframe of iframes) {
                         try {
                             const src = iframe.src || '';
-                            if (src.includes('turnstile') || src.includes('cloudflare')) {
+                            if (src.includes('turnstile') || src.includes('cloudflare') || src.includes('challenges')) {
                                 const url = new URL(src);
                                 const sitekey = url.searchParams.get('sitekey') || url.searchParams.get('k');
                                 if (sitekey) return sitekey;
@@ -418,6 +464,46 @@ public class CaptchaSolverService {
                             if (container) return container.getAttribute('data-sitekey');
                         }
                     }
+
+                    // Method 4: Extract from page HTML/scripts (Cloudflare Managed Challenge)
+                    const scripts = Array.from(document.querySelectorAll('script'));
+                    for (let script of scripts) {
+                        const content = script.textContent || script.innerHTML;
+
+                        // Look for sitekey in various formats
+                        const patterns = [
+                            /sitekey["']?\\s*:\\s*["']([0x][A-Za-z0-9_-]+)["']/i,
+                            /data-sitekey=["']([0x][A-Za-z0-9_-]+)["']/i,
+                            /turnstile\\.render\\([^,]+,\\s*\\{[^}]*sitekey:\\s*["']([0x][A-Za-z0-9_-]+)["']/i,
+                            /"sitekey":"([0x][A-Za-z0-9_-]+)"/i,
+                            /'sitekey':'([0x][A-Za-z0-9_-]+)'/i,
+                        ];
+
+                        for (let pattern of patterns) {
+                            const match = content.match(pattern);
+                            if (match && match[1]) {
+                                return match[1];
+                            }
+                        }
+                    }
+
+                    // Method 5: Check window object for turnstile config
+                    try {
+                        if (window.turnstile) {
+                            const containers = document.querySelectorAll('[id*="turnstile"], [class*="turnstile"], [id*="cf-"], [class*="cf-challenge"]');
+                            for (let container of containers) {
+                                const sitekey = container.getAttribute('data-sitekey') ||
+                                               container.dataset.sitekey ||
+                                               container.getAttribute('sitekey');
+                                if (sitekey) return sitekey;
+                            }
+                        }
+                    } catch (e) {}
+
+                    // Method 6: Search entire page HTML as last resort
+                    const htmlContent = document.documentElement.innerHTML;
+                    const htmlMatch = htmlContent.match(/["']sitekey["']\\s*:\\s*["']([0x][A-Za-z0-9_-]{20,})["']/i);
+                    if (htmlMatch) return htmlMatch[1];
 
                     return null;
                 }
