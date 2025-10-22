@@ -49,7 +49,22 @@ public class HltvScraperService {
             log.info("Browser is available, starting initial scrape");
             new Thread(this::startScraping).start();
         } else {
-            log.warn("Browser is not available - scraping is disabled. Use mock endpoints at /api/mock/matches for offline development");
+            log.warn("Browser is not available yet - will start scraping when browser becomes ready");
+            // Start a thread to wait for browser availability
+            new Thread(() -> {
+                while (!browserService.isBrowserAvailable() && !browserService.isShuttingDown()) {
+                    try {
+                        Thread.sleep(5000); // Check every 5 seconds
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+                if (browserService.isBrowserAvailable() && !isScraperRunning) {
+                    log.info("Browser is now available, starting initial scrape");
+                    startScraping();
+                }
+            }).start();
         }
     }
 

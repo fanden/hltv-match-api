@@ -20,8 +20,35 @@ public class BrowserService {
 
     public BrowserService(ScraperConfig config) {
         this.config = config;
-        // Don't initialize browser in constructor - do it lazily when needed
-        // This allows the app to start even when offline
+        // Start background thread to retry browser initialization
+        startBrowserInitializationThread();
+    }
+
+    private void startBrowserInitializationThread() {
+        Thread initThread = new Thread(() -> {
+            while (!browserInitialized && !isShuttingDown) {
+                try {
+                    log.info("Attempting to initialize browser...");
+                    initializeBrowser();
+                    if (browserInitialized) {
+                        log.info("Browser initialized successfully");
+                        break;
+                    }
+                } catch (Exception e) {
+                    log.warn("Browser initialization attempt failed, will retry in 30 seconds: {}", e.getMessage());
+                }
+
+                try {
+                    Thread.sleep(30000); // Wait 30 seconds before retry
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.info("Browser initialization thread interrupted");
+                    break;
+                }
+            }
+        }, "browser-init-thread");
+        initThread.setDaemon(true);
+        initThread.start();
     }
 
     private synchronized void initializeBrowser() {
@@ -30,28 +57,62 @@ public class BrowserService {
         }
 
         try {
-            log.info("Initializing browser service...");
-            playwright = Playwright.create();
-
             if (config.getBrowserless().isEnabled()) {
-                log.info("Initializing Playwright browser connection to Browserless at {}", config.getBrowserless().getUrl());
+                String browserlessUrl = config.getBrowserless().getUrl();
+                log.info("Connecting to Browserless at {}", browserlessUrl);
+
+                try {
+                    // Create Playwright instance
+                    playwright = Playwright.create();
+                    log.info("Playwright instance created successfully");
+                } catch (Exception e) {
+                    log.error("Failed to create Playwright instance", e);
+                    throw e;
+                }
+
+                // Browserless CDP endpoint - Playwright will automatically fetch /json/version
+                // from http://<host>:<port>/json/version to get the webSocketDebuggerUrl
+                String cdpEndpoint = browserlessUrl;
+
+                // Ensure we use http:// for the initial HTTP request
+                // Playwright will query /json/version and then connect via WebSocket
+                if (cdpEndpoint.startsWith("ws://")) {
+                    cdpEndpoint = cdpEndpoint.replace("ws://", "http://");
+                } else if (cdpEndpoint.startsWith("wss://")) {
+                    cdpEndpoint = cdpEndpoint.replace("wss://", "https://");
+                }
+
+                log.info("Using CDP endpoint: {}", cdpEndpoint);
+
                 // Connect to remote Browserless instance via CDP
-                browser = playwright.chromium().connectOverCDP(config.getBrowserless().getUrl());
+                browser = playwright.chromium().connectOverCDP(cdpEndpoint);
                 log.info("Successfully connected to Browserless");
+                browserInitialized = true;
             } else {
                 log.info("Launching local Chromium browser with visible window");
                 log.warn("IMPORTANT: Make sure Playwright browsers are installed by running: mvn exec:java -e -D exec.mainClass=com.microsoft.playwright.CLI -D exec.args=\"install chromium\"");
+
+                playwright = Playwright.create();
                 browser = playwright.chromium().launch(new com.microsoft.playwright.BrowserType.LaunchOptions()
                     .setHeadless(false) // Visible browser window
                     .setSlowMo(50) // Slow down by 50ms to make actions visible
                     .setTimeout(60000)); // 60 second timeout for browser to start
                 log.info("Successfully launched local browser");
+                browserInitialized = true;
             }
-            browserInitialized = true;
         } catch (Exception e) {
-            log.error("Failed to initialize browser connection - scraping will not be available", e);
-            // Don't throw - just log the error and allow app to continue
+            log.warn("Failed to initialize browser connection, will retry: {}", e.getMessage(), e);
+            // Don't throw - just log the error and allow retry
             browserInitialized = false;
+            // Clean up any partial initialization
+            if (browser != null) {
+                try { browser.close(); } catch (Exception ex) { /* ignore */ }
+                browser = null;
+            }
+            if (playwright != null) {
+                try { playwright.close(); } catch (Exception ex) { /* ignore */ }
+                playwright = null;
+            }
         }
     }
 
@@ -60,13 +121,8 @@ public class BrowserService {
     }
 
     public Page createStealthPage() {
-        // Initialize browser if not already done
-        if (!browserInitialized) {
-            initializeBrowser();
-        }
-
         if (!isBrowserAvailable()) {
-            throw new RuntimeException("Browser is not available - cannot create page");
+            throw new RuntimeException("Browser is not available yet - please wait for browserless service to start");
         }
 
         try {
